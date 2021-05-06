@@ -1,41 +1,57 @@
 import configs
 import os
 import json
-import numpy as np
 
+import numpy as np
 import tensorflow as tf
+
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from transformers import TFGPT2LMHeadModel, TFGPT2ForSequenceClassification, GPT2Config
-from transformers import TFTrainer, TFTrainingArguments
+from transformers import (
+    TFTrainer,
+    TFTrainingArguments,
+    TFAutoModelForSequenceClassification,
+    AutoConfig,
+)
 from transformers import XLNetTokenizer
 
 
-# if os.environ.get("CUDA_VISIBLE_DEVICES") != "-1":
-#     tf.keras.mixed_precision.set_global_policy("mixed_float16")
+def get_label_config(task_name: str):
+    lines = open(os.path.join(configs.DATA_PATH, task_name, "labels.json")).readlines()
+    labels = [json.loads(line)["label_desc"] for line in lines]
+    label2id = {}
+    id2label = {}
+    for i, label in enumerate(labels):
+        label2id[label] = i
+        id2label[i] = label
+    return {
+        "label2id": label2id,
+        "id2label": id2label,
+        "num_labels": len(lines),
+    }
 
 
-def load_json2list(filename):
+def load_json2list(filename, task_name):
+    label_configs = get_label_config(task_name)
+    label2id = label_configs["label2id"]
     with open(filename) as f:
         for line in f.readlines():
             if line:
                 data = json.loads(line)
+                if data.get("label_desc"):
+                    data["label"] = label2id[data["label_desc"]]
                 yield data
 
 
 def load_dataset(task_name: str):
     path = os.path.join(configs.DATA_PATH, task_name)
+
     train_file = os.path.join(path, "train.json")
     dev_file = os.path.join(path, "dev.json")
     test_file = os.path.join(path, "test.json")
-    train_dataset = list(load_json2list(train_file))
-    dev_dataset = list(load_json2list(dev_file))
-    test_dataset = list(load_json2list(test_file))
+    train_dataset = list(load_json2list(train_file, task_name))
+    dev_dataset = list(load_json2list(dev_file, task_name))
+    test_dataset = list(load_json2list(test_file, task_name))
     return train_dataset, dev_dataset, test_dataset
-
-
-def get_label_nums(task_name: str):
-    lines = open(os.path.join(configs.DATA_PATH, task_name, "labels.json")).readlines()
-    return len(lines) + 2
 
 
 def load_tokenizer():
@@ -52,9 +68,9 @@ def cover_dataset2np(dataset, is_test=False):
         for item in dataset
     ]
     if not is_test:
-        labels = [int(item["label"]) - 100 for item in dataset]
+        labels = [item["label"] for item in dataset]
 
-        labels = np.array(labels, dtype=np.int)
+        labels = np.array(labels)
         labels = labels.reshape(-1, 1)
     else:
         labels = None
@@ -77,17 +93,16 @@ def cover_dataset2np(dataset, is_test=False):
 
 def cover_np2tfds(inputs, labels):
     return (
-        tf.data.Dataset.from_tensor_slices((inputs, labels))
-        # .shuffle(inputs.shape[0], reshuffle_each_iteration=True)
-        # .batch(configs.BATCH_SIZE)
+        tf.data.Dataset.from_tensor_slices((inputs, labels)).shuffle(
+            inputs.shape[0], reshuffle_each_iteration=False
+        )
     )
 
 
-def load_model(task_name: str) -> TFGPT2ForSequenceClassification:
-    model_config = GPT2Config.from_pretrained(
-        configs.MODEL_PATH, num_labels=get_label_nums(task_name)
-    )
-    model = TFGPT2ForSequenceClassification.from_pretrained(
+def load_model(task_name: str) -> TFAutoModelForSequenceClassification:
+    label_config = get_label_config(task_name)
+    model_config = AutoConfig.from_pretrained(configs.MODEL_PATH, **label_config)
+    model = TFAutoModelForSequenceClassification.from_pretrained(
         configs.MODEL_PATH, config=model_config
     )
     return model
@@ -97,7 +112,7 @@ def compute_metrics(pred):
     labels = pred.label_ids
     preds = pred.predictions.argmax(-1)
     precision, recall, f1, _ = precision_recall_fscore_support(
-        labels, preds, average="micro"
+        labels, preds, average="weighted"
     )
     acc = accuracy_score(labels, preds)
     return {"accuracy": acc, "f1": f1, "precision": precision, "recall": recall}
@@ -107,27 +122,27 @@ def init_trainer(train_dataset, dev_dataset, task_name):
     training_args = TFTrainingArguments(
         output_dir=os.path.join(configs.OUTPUT_PATH, task_name),
         do_eval=True,
-        num_train_epochs=20,  # total # of training epochs
-        per_device_train_batch_size=16,  # batch size per device during training
-        per_device_eval_batch_size=64,  # batch size for evaluation
+        num_train_epochs=2,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=64,
         warmup_steps=500,
-        weight_decay=0.01,  # strength of weight decay
+        weight_decay=0.01,
         logging_dir=os.path.join(
             configs.OUTPUT_PATH, task_name, "logs"
-        ),  # directory for storing logs
+        ),
         save_steps=5000,
         logging_strategy="steps",
-        logging_steps=20,
+        logging_steps=50,
         eval_steps=500,
         evaluation_strategy="steps",
     )
     with training_args.strategy.scope():
         model = load_model(task_name)
     trainer = TFTrainer(
-        model=model,  # the instantiated 🤗 Transformers model to be trained
-        args=training_args,  # training arguments, defined above
-        train_dataset=train_dataset,  # training dataset
-        eval_dataset=dev_dataset,  # evaluation dataset
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=dev_dataset,
         compute_metrics=compute_metrics,
     )
     return trainer
@@ -142,9 +157,6 @@ if __name__ == "__main__":
     train_dataset = cover_np2tfds(*train_dataset)
     dev_dataset = cover_np2tfds(*dev_dataset)
 
-    # optimizer = tf.keras.optimizers.Adam(learning_rate=3e-5)
-    # model.compile(optimizer=optimizer, loss=model.compute_loss)
-    # model.fit(train_dataset)
     trainer = init_trainer(train_dataset, dev_dataset, task_name)
     trainer.train()
     res = trainer.evaluate()
